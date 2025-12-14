@@ -1321,3 +1321,925 @@ Mempool满 (>5000 txs):
 2. [dYdX v4 Technical Architecture](https://dydx.exchange/blog/v4-technical-architecture-overview)
 3. [Cosmos SDK Documentation](https://docs.cosmos.network/)
 4. [Tendermint Consensus Algorithm](https://arxiv.org/abs/1807.04938)
+
+---
+
+## 附录D: 深入研究专题
+
+### D.1 dYdX v4 Chain的主要状态管理
+
+#### D.1.1 状态类型概览
+
+dYdX v4 Chain采用**多层状态管理架构**，在不同的存储层和生命周期中管理不同类型的状态。
+
+#### D.1.2 订单相关状态
+
+##### 1. 短期订单（Short-Term Orders）
+
+**存储位置**：
+- **主存储**：MemClob内存（`MemClobPriceTimePriority.orderbooks`）
+- **数据结构**：`Orderbook`结构体
+- **文件位置**：[protocol/x/clob/memclob/memclob.go](protocol/x/clob/memclob/memclob.go)
+
+**特性**：
+```go
+// 仅在内存中存在，不持久化到KVStore
+type Orderbook struct {
+    Asks                           map[types.Subticks]*types.Level
+    Bids                           map[types.Subticks]*types.Level
+    BestAsk, BestBid              types.Subticks
+    orderIdToLevelOrder            map[types.OrderId]*types.LevelOrder
+    blockExpirationsForOrders      map[uint32]map[types.OrderId]bool
+    orderIdToCancelExpiry          map[types.OrderId]uint32
+    // ...更多索引
+}
+```
+
+**生命周期**：
+- 创建：在CheckTx阶段添加到MemClob
+- 有效期：GoodTilBlock（当前块 + 1 至 当前块 + ShortBlockWindow）
+- 销毁：区块结束后或完全成交后从MemClob移除
+- 不持久化：仅存在于当前区块的内存中
+
+**填充量持久化**：
+虽然订单本身不持久化，但成交量会写入KVStore：
+```go
+// 存储前缀: OrderAmountFilledKeyPrefix = "Fill:"
+keeper.SetOrderFillAmount(ctx, orderId, fillAmount, prunableBlockHeight)
+```
+
+##### 2. 长期订单（Long-Term Orders）
+
+**存储位置**（多层）：
+
+**层1：主存储（KVStore）**
+- 前缀：`LongTermOrderPlacementKeyPrefix = "SO/P/L:"`
+- 数据：`LongTermOrderPlacement`消息
+- 持久化：在DeliverTx阶段写入
+- 文件：[protocol/x/clob/keeper/stateful_order_state.go](protocol/x/clob/keeper/stateful_order_state.go)
+
+```go
+func (k Keeper) SetLongTermOrderPlacement(
+    ctx sdk.Context,
+    order types.Order,
+    blockHeight uint32,
+) {
+    placement := types.LongTermOrderPlacement{
+        Order:            order,
+        PlacementIndex:   types.TransactionOrdering{...},
+    }
+    store := ctx.KVStore(k.storeKey)
+    key := order.OrderId.ToStateKey()
+    store.Set(key, k.cdc.MustMarshal(&placement))
+}
+```
+
+**层2：内存缓存（MemClob）**
+- 从KVStore加载到MemClob（在PrepareCheckState）
+- 参与实时撮合
+- 每个区块重新加载
+
+**层3：临时存储（TransientStore）**
+- 前缀：`UncommittedStatefulOrderPlacementTransientStore`
+- 用途：追踪CheckTx期间未提交的订单
+- 生命周期：仅在区块边界内有效
+
+**层4：过期索引**
+- 前缀：`StatefulOrdersExpirationsKeyPrefix = "SOExp:"`
+- 结构：`{GoodTilBlockTime} -> []OrderId`
+- 用途：EndBlocker中快速查找过期订单
+
+**完整生命周期**：
+```
+CheckTx阶段:
+├─ 写入UncommittedStatefulOrderPlacementTransientStore
+└─ 生成操作提议
+
+DeliverTx阶段:
+├─ SetLongTermOrderPlacement() → 主KVStore
+├─ AddStatefulOrderIdExpiration() → 过期索引
+└─ 增加订单计数
+
+PrepareCheckState阶段:
+├─ 从KVStore加载所有长期订单
+├─ PlaceStatefulOrdersFromLastBlock() → MemClob
+└─ 参与撮合
+
+EndBlocker阶段:
+├─ RemoveExpiredStatefulOrders() → 检查过期
+├─ 完全成交的订单被移除
+└─ 从所有存储层删除
+```
+
+##### 3. 条件订单（Conditional Orders）
+
+**状态机模型**：
+
+```
+┌─────────────────────────────────────────────────┐
+│                未触发状态                        │
+│  存储: UntriggeredConditionalOrderKeyPrefix     │
+│  前缀: "SO/U:"                                  │
+│  检查: EndBlocker中每个区块检查触发条件         │
+└─────────────────────────────────────────────────┘
+                    ↓
+          [触发条件满足]
+                    ↓
+┌─────────────────────────────────────────────────┐
+│                已触发状态                        │
+│  存储: TriggeredConditionalOrderKeyPrefix       │
+│  前缀: "SO/P/T:"                                │
+│  操作: 在PrepareCheckState放置到MemClob         │
+└─────────────────────────────────────────────────┘
+                    ↓
+          [放置到订单簿]
+                    ↓
+┌─────────────────────────────────────────────────┐
+│              在MemClob上活跃                     │
+│  行为: 与普通长期订单相同                        │
+└─────────────────────────────────────────────────┘
+```
+
+**触发检查**：
+```go
+// EndBlocker中执行
+func (k Keeper) MaybeTriggerConditionalOrders(
+    ctx sdk.Context,
+) (triggeredConditionalOrderIds []types.OrderId) {
+    // 遍历所有未触发的条件订单
+    // 检查触发条件（价格、时间等）
+    // 将满足条件的订单移动到已触发状态
+}
+```
+
+#### D.1.3 账户和子账户状态
+
+##### 1. Subaccount状态
+
+**存储位置**：
+- **KVStore前缀**：`SubaccountKeyPrefix = "SA:"`
+- **Keeper**：SubaccountsKeeper
+- **文件**：[protocol/x/subaccounts/keeper/subaccount.go](protocol/x/subaccounts/keeper/subaccount.go)
+
+**数据结构**：
+```go
+type Subaccount struct {
+    Id                  SubaccountId
+    AssetPositions      []AssetPosition      // USDC等资产余额
+    PerpetualPositions  []PerpetualPosition  // 永续合约头寸
+}
+
+type AssetPosition struct {
+    AssetId  uint32  // 资产ID
+    Quantums uint64  // 数量（最小单位）
+}
+
+type PerpetualPosition struct {
+    PerpetualId      uint32  // 永续合约ID
+    Quantums         int64   // 持仓数量（正为多，负为空）
+    FundingIndex     int64   // 资金费率索引
+}
+```
+
+**关键操作**：
+```go
+// 读取（默认返回空结构体）
+func (k Keeper) GetSubaccount(ctx sdk.Context, id SubaccountId) Subaccount
+
+// 写入（空子账户会被删除）
+func (k Keeper) SetSubaccount(ctx sdk.Context, subaccount Subaccount)
+
+// 更新头寸
+func (k Keeper) UpdateSubaccountPositionWithFundingPayment(
+    ctx sdk.Context,
+    subaccountId SubaccountId,
+    perpetualId uint32,
+    fundingPayment *big.Int,
+)
+```
+
+##### 2. 安全堆（Safety Heap）
+
+**用途**：按安全等级排序维护子账户，用于快速识别需要清算的账户
+
+**存储结构**：
+```
+SafetyHeapStorePrefix = "SH"
+├─ Heap/           → []SubaccountId（堆数组）
+├─ Idx/{saId}      → HeapIndex（子账户→堆索引映射）
+└─ Len/            → 堆长度
+```
+
+**操作**：
+- 插入：新子账户加入堆
+- 更新：头寸变化后重新排序
+- 提取：获取最不安全的子账户用于清算
+
+##### 3. 负TNC子账户追踪
+
+**存储前缀**：
+```
+NegativeTncSubaccountForCollateralPoolSeenAtBlockKeyPrefix = "NegSA:"
+```
+
+**用途**：
+- 追踪最后一次见到负总净抵押品（Total Net Collateral）的区块高度
+- 用于提款限制（Gate Withdrawals）
+- 按抵押池隔离（支持跨抵押和隔离市场）
+
+#### D.1.4 订单填充量状态
+
+**存储位置**：
+- **前缀**：`OrderAmountFilledKeyPrefix = "Fill:"`
+- **键格式**：`orderId.ToStateKey()`
+- **文件**：[protocol/x/clob/keeper/order_state.go](protocol/x/clob/keeper/order_state.go)
+
+**数据结构**：
+```go
+type OrderFillState struct {
+    FillAmount          uint64  // 已填充的基础数量
+    PrunableBlockHeight uint32  // 可以修剪此状态的区块高度
+}
+```
+
+**操作流程**：
+```go
+// 写入填充量
+func (k Keeper) SetOrderFillAmount(
+    ctx sdk.Context,
+    orderId types.OrderId,
+    fillAmount satypes.BaseQuantums,
+    prunableBlockHeight uint32,
+) {
+    store := ctx.KVStore(k.storeKey)
+    fillState := types.OrderFillState{
+        FillAmount:          fillAmount.ToUint64(),
+        PrunableBlockHeight: prunableBlockHeight,
+    }
+    store.Set(orderId.ToStateKey(), k.cdc.MustMarshal(&fillState))
+}
+
+// 读取填充量
+func (k Keeper) GetOrderFillAmount(
+    ctx sdk.Context,
+    orderId types.OrderId,
+) satypes.BaseQuantums {
+    store := ctx.KVStore(k.storeKey)
+    fillStateBytes := store.Get(orderId.ToStateKey())
+    if fillStateBytes == nil {
+        return 0
+    }
+    var fillState types.OrderFillState
+    k.cdc.MustUnmarshal(fillStateBytes, &fillState)
+    return satypes.BaseQuantums(fillState.FillAmount)
+}
+```
+
+**修剪机制**：
+```go
+// EndBlocker中执行
+func (k Keeper) PruneStateFillAmountsForShortTermOrders(ctx sdk.Context) {
+    currentBlock := ctx.BlockHeight()
+    // 遍历所有可修剪的订单
+    k.PruneOrdersForBlockHeight(ctx, uint32(currentBlock))
+}
+```
+
+#### D.1.5 CLOB配置状态
+
+##### 1. Clob Pair配置
+
+**存储前缀**：`ClobPairKeyPrefix = "Clob:"`
+
+**数据结构**：
+```go
+type ClobPair struct {
+    Id                  uint32
+    Metadata            ClobMetadata  // Perpetual或Spot
+    StepBaseQuantums    uint64        // 最小订单数量增量
+    SubticksPerTick     uint32        // 价格精度
+    QuantumConversionExponent int32   // 数量转换指数
+    Status              ClobPairStatus // ACTIVE, PAUSED, CANCEL_ONLY等
+}
+```
+
+##### 2. 清算配置
+
+**存储键**：`LiquidationsConfigKey = "LiqCfg"`
+
+**内容**：
+- 清算保险基金费用PPM
+- 验证者清算费用PPM
+- 流动性清算费用PPM
+- 填充价格上限PPM
+
+##### 3. 区块速率限制
+
+**存储键**：`BlockRateLimitConfigKey = "RateLimCfg"`
+
+**用途**：限制每个区块的订单/取消操作数量
+
+##### 4. 权益级别限制
+
+**存储键**：`EquityTierLimitConfigKey = "EqTierCfg"`
+
+**用途**：基于账户权益的订单数量和规模限制
+
+#### D.1.6 ProcessProposerMatchesEvents状态
+
+**存储位置**：MemStore（块内临时）
+
+**存储键**：`ProcessProposerMatchesEventsKey`
+
+**数据结构**：
+```go
+type ProcessProposerMatchesEvents struct {
+    BlockHeight                            uint32
+    OrderIdsFilledInLastBlock              []OrderId
+    ExpiredStatefulOrderIds                []OrderId
+    ConditionalOrderIdsTriggeredInLastBlock []OrderId
+    RemovedStatefulOrderIds                []OrderId
+}
+```
+
+**用途**：
+- 在BeginBlocker中生成
+- 在EndBlocker中更新
+- 在PrepareCheckState中使用
+- 用于同步MemClob状态
+
+**生命周期**：
+```
+BeginBlock:
+├─ 初始化为空
+└─ BlockHeight设置为当前高度
+
+DeliverTx:
+├─ 记录处理的订单ID
+└─ 累积成交信息
+
+EndBlocker:
+├─ 添加过期订单ID
+├─ 添加触发的条件订单ID
+└─ MustSetProcessProposerMatchesEvents()
+
+PrepareCheckState:
+├─ GetProcessProposerMatchesEvents()
+├─ 使用这些ID同步MemClob
+└─ 清理已完成的订单
+```
+
+#### D.1.7 已交付订单ID（MemStore）
+
+**长期订单**：
+- **前缀**：`OrderedDeliveredLongTermOrderKeyPrefix = "DLTO:"`
+- **用途**：追踪在DeliverTx中已处理的长期订单
+
+**条件订单**：
+- **前缀**：`OrderedDeliveredConditionalOrderKeyPrefix = "DCIdx:"`
+- **用途**：追踪在DeliverTx中已处理的条件订单
+
+**取消订单**：
+- **前缀**：`DeliveredCancelKeyPrefix = "DCancel:"`
+- **用途**：追踪已取消的订单
+
+**特性**：
+- 存储在MemStore（块内有效）
+- 按顺序追踪
+- PrepareCheckState使用这些ID重新加载订单
+
+#### D.1.8 状态存储层次总结
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   存储层次架构                           │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  Layer 1: 持久化存储（KVStore - Disk）                  │
+│  ├─ 长期订单                                            │
+│  ├─ 条件订单（未触发/已触发）                            │
+│  ├─ 订单填充量                                          │
+│  ├─ Subaccount状态                                      │
+│  ├─ CLOB配置                                            │
+│  └─ 过期索引                                            │
+│                                                         │
+│  Layer 2: 内存存储（MemStore - RAM，块内）              │
+│  ├─ ProcessProposerMatchesEvents                        │
+│  ├─ 已交付订单ID列表                                    │
+│  ├─ 订单计数                                            │
+│  └─ 块内临时数据                                        │
+│                                                         │
+│  Layer 3: 瞬态存储（TransientStore - 块边界重置）       │
+│  ├─ 未提交的长期订单                                    │
+│  ├─ 未提交的取消                                        │
+│  └─ 未提交的订单计数                                    │
+│                                                         │
+│  Layer 4: MemClob（纯内存 - 应用层）                    │
+│  ├─ 短期订单簿                                          │
+│  ├─ 长期订单副本（从KVStore加载）                        │
+│  ├─ 操作队列                                            │
+│  └─ 订单哈希索引                                        │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+### D.2 CheckTx与共识后执行阶段的MemClob状态修改
+
+这是一个关键问题，涉及状态一致性和共识安全性。
+
+#### D.2.1 MemClob状态修改总览
+
+**核心原则**：
+- **CheckTx阶段**：对MemClob进行修改，但这些修改是**临时的**
+- **DeliverTx阶段**：对持久化状态进行修改，MemClob仅作为缓存
+- **PrepareCheckState**：同步两者的状态
+
+#### D.2.2 CheckTx阶段的MemClob修改
+
+**修改流程**：
+
+```go
+// 文件: protocol/x/clob/memclob/memclob.go
+func (m *MemClobPriceTimePriority) PlaceOrder(
+    ctx sdk.Context,
+    order types.Order,
+) (BaseQuantums, OrderStatus, *OffchainUpdates, error) {
+
+    // 1. 验证订单
+    if err := m.validateOrder(ctx, order); err != nil {
+        return 0, OrderStatus{}, nil, err
+    }
+
+    // 2. 尝试匹配现有订单（使用分支上下文）
+    matchedQuantums, matchedOrder, err := m.matchOrder(ctx, order)
+
+    // 3. 如果有剩余数量，添加到订单簿
+    if order.GetBaseQuantums() > matchedQuantums {
+        m.mustAddOrderToOrderbook(ctx, order, isPostOnlyOrder)
+        // ↑ 这会直接修改MemClob的orderbooks map
+    }
+
+    // 4. 添加到操作队列
+    m.operationsToPropose.MustAddShortTermOrderPlacementToOperationsQueue(
+        order,
+        transactionIndex,
+    )
+    // ↑ 这会修改MemClob的operationsToPropose
+
+    return matchedQuantums, orderStatus, offchainUpdates, nil
+}
+```
+
+**具体修改的MemClob状态**：
+
+1. **订单簿（Orderbooks）**：
+```go
+// 添加订单到订单簿
+func (o *Orderbook) addOrderToOrderbook(
+    order Order,
+    levelOrder *types.LevelOrder,
+) {
+    // 修改Bids或Asks map
+    if order.IsBuy() {
+        o.addLevelOrderToLevel(order.GetOrderSubticks(), levelOrder, o.Bids)
+        // 更新BestBid
+        if order.GetOrderSubticks() > o.BestBid {
+            o.BestBid = order.GetOrderSubticks()
+        }
+    } else {
+        o.addLevelOrderToLevel(order.GetOrderSubticks(), levelOrder, o.Asks)
+        // 更新BestAsk
+        if order.GetOrderSubticks() < o.BestAsk {
+            o.BestAsk = order.GetOrderSubticks()
+        }
+    }
+
+    // 添加到各种索引
+    o.orderIdToLevelOrder[order.OrderId] = levelOrder
+    o.blockExpirationsForOrders[order.GoodTilBlock][order.OrderId] = true
+    // ...
+}
+```
+
+2. **操作队列（OperationsToPropose）**：
+```go
+type OperationsToPropose struct {
+    OperationsQueue                []InternalOperation  // ← 追加操作
+    OrderHashesInOperationsQueue   map[OrderHash]bool   // ← 添加哈希
+    ShortTermOrderHashToTxBytes    map[OrderHash][]byte // ← 保存TX字节
+    MatchedOrderIdToOrder          map[OrderId]Order    // ← 记录匹配
+    // ...
+}
+
+func (o *OperationsToPropose) MustAddShortTermOrderPlacementToOperationsQueue(
+    order Order,
+) {
+    operation := InternalOperation_ShortTermOrderPlacement{
+        ShortTermOrderPlacement: &MsgPlaceOrder{Order: order},
+    }
+    o.OperationsQueue = append(o.OperationsQueue, operation)
+    // ↑ 直接修改队列
+
+    orderHash := order.GetOrderHash()
+    o.OrderHashesInOperationsQueue[orderHash] = true
+    // ↑ 修改哈希集合
+}
+```
+
+3. **子账户开放订单追踪**：
+```go
+// 在订单簿中追踪
+o.SubaccountOpenClobOrders[subaccountId][order.Side][order.OrderId] = true
+
+// 如果是减仓订单
+if order.IsReduceOnly() {
+    o.SubaccountOpenReduceOnlyOrders[subaccountId][order.OrderId] = true
+}
+```
+
+**关键点**：
+- ✅ **确实修改了MemClob**：订单被添加到内存订单簿
+- ✅ **操作被记录**：添加到`OperationsToPropose`队列
+- ⚠️ **状态不持久化**：这些修改仅在CheckState中
+- ⚠️ **可能被丢弃**：如果交易未被包含在区块中
+
+#### D.2.3 DeliverTx阶段的状态处理
+
+**重要区别**：在DeliverTx阶段，订单不是通过`PlaceOrder`再次添加到MemClob！
+
+**实际流程**：
+
+```go
+// 文件: protocol/x/clob/keeper/msg_server_proposed_operations.go
+func (k msgServer) ProposedOperations(
+    ctx sdk.Context,
+    msg *types.MsgProposedOperations,
+) (*types.MsgProposedOperationsResponse, error) {
+
+    lib.AssertDeliverTxMode(ctx)  // 断言在DeliverTx模式
+
+    // 1. 验证和转换操作
+    processedOperations := k.ProcessOperations(ctx, msg.OperationsQueue)
+
+    // 2. 处理内部操作
+    for _, operation := range processedOperations {
+        switch op := operation.(type) {
+        case *InternalOperation_Match:
+            // 处理匹配
+            k.PersistMatchToState(ctx, op.Match)
+            // ↑ 这会更新KVStore，不是MemClob！
+
+        case *InternalOperation_ShortTermOrderPlacement:
+            // 短期订单：仅更新填充量
+            // MemClob已经在CheckTx时处理过了
+
+        case *InternalOperation_PreexistingStatefulOrder:
+            // 长期订单：标记为已交付
+            k.AddDeliveredLongTermOrderId(ctx, op.OrderId)
+            // ↑ 写入MemStore，不是MemClob！
+        }
+    }
+
+    // 3. 生成事件
+    k.GenerateProcessProposerMatchesEvents(ctx)
+
+    return &types.MsgProposedOperationsResponse{}, nil
+}
+```
+
+**持久化操作**：
+
+```go
+// 持久化匹配到状态
+func (k Keeper) PersistMatchToState(
+    ctx sdk.Context,
+    match *types.ClobMatch,
+) {
+    lib.AssertDeliverTxMode(ctx)
+
+    // 更新订单填充量（KVStore）
+    k.SetOrderFillAmount(ctx, takerOrderId, newFillAmount, prunableBlockHeight)
+
+    // 更新子账户头寸（KVStore）
+    k.subaccountsKeeper.UpdateSubaccount(ctx, takerSubaccount)
+    k.subaccountsKeeper.UpdateSubaccount(ctx, makerSubaccount)
+
+    // 生成事件
+    ctx.EventManager().EmitEvent(orderFillEvent)
+
+    // ↑ 注意：没有修改MemClob！
+}
+```
+
+**关键观察**：
+- ❌ **不修改MemClob**：DeliverTx阶段不会调用`MemClob.PlaceOrder()`
+- ✅ **仅持久化状态**：更新KVStore中的订单填充量
+- ✅ **记录已交付订单**：添加到MemStore中的已交付列表
+- ✅ **生成事件**：为Indexer生成事件
+
+**为什么不修改MemClob？**
+
+因为MemClob的目的是为**下一个区块**准备操作，而DeliverTx处理的是**当前区块**的确定结果。当前区块的MemClob状态会在PrepareCheckState被丢弃和重建。
+
+#### D.2.4 PrepareCheckState的状态同步
+
+这是关键的同步点，确保CheckState的MemClob与DeliverState的持久化状态一致。
+
+**完整流程**：
+
+```go
+// 文件: protocol/x/clob/abci.go
+func (k Keeper) PrepareCheckState(ctx sdk.Context) {
+
+    ctx.Logger().Info("CLOB PrepareCheckState Start")
+
+    // ═══════════════════════════════════════════════════
+    // 阶段1: 获取要重放的操作
+    // ═══════════════════════════════════════════════════
+    localValidatorOperationsQueue, shortTermOrderTxBytes :=
+        k.MemClob.GetOperationsToReplay(ctx)
+    // ↑ 从当前MemClob提取本地验证器的操作
+
+    // ═══════════════════════════════════════════════════
+    // 阶段2: 清除MemClob中的本地操作
+    // ═══════════════════════════════════════════════════
+    k.MemClob.RemoveAndClearOperationsQueue(
+        ctx,
+        localValidatorOperationsQueue,
+    )
+    // ↑ 删除MemClob中所有本地放置的订单
+    // ↑ 清空operationsToPropose队列
+
+    // ═══════════════════════════════════════════════════
+    // 阶段3: 获取上一块的匹配事件
+    // ═══════════════════════════════════════════════════
+    processProposerMatchesEvents :=
+        k.GetProcessProposerMatchesEvents(ctx)
+
+    // ═══════════════════════════════════════════════════
+    // 阶段4: 清除无效的MemClob状态
+    // ═══════════════════════════════════════════════════
+    offchainUpdates = k.MemClob.PurgeInvalidMemclobState(
+        ctx,
+        processProposerMatchesEvents.OrderIdsFilledInLastBlock,
+        // ↑ 移除完全填充的订单
+
+        processProposerMatchesEvents.ExpiredStatefulOrderIds,
+        // ↑ 移除过期的长期订单
+
+        k.GetDeliveredCancelledOrderIds(ctx),
+        // ↑ 移除已取消的订单
+
+        processProposerMatchesEvents.RemovedStatefulOrderIds,
+        // ↑ 移除其他被移除的订单
+
+        offchainUpdates,
+    )
+
+    // ═══════════════════════════════════════════════════
+    // 阶段5: 重新加载长期订单（Post-Only通过）
+    // ═══════════════════════════════════════════════════
+    longTermOrderIds := k.GetDeliveredLongTermOrderIds(ctx)
+    offchainUpdates = k.PlaceStatefulOrdersFromLastBlock(
+        ctx,
+        longTermOrderIds,
+        offchainUpdates,
+        true,  // postOnlyFilter = true
+    )
+    // ↑ 从KVStore读取订单
+    // ↑ 调用MemClob.PlaceOrder()添加到订单簿（仅非立即成交）
+
+    // ═══════════════════════════════════════════════════
+    // 阶段6: 重新加载条件订单（Post-Only通过）
+    // ═══════════════════════════════════════════════════
+    conditionalOrderIds :=
+        processProposerMatchesEvents.ConditionalOrderIdsTriggeredInLastBlock
+    offchainUpdates = k.PlaceConditionalOrdersTriggeredInLastBlock(
+        ctx,
+        conditionalOrderIds,
+        offchainUpdates,
+        true,  // postOnlyFilter = true
+    )
+
+    // ═══════════════════════════════════════════════════
+    // 阶段7: 重放本地操作（Post-Only通过）
+    // ═══════════════════════════════════════════════════
+    replayUpdates := k.MemClob.ReplayOperations(
+        ctx,
+        localValidatorOperationsQueue,
+        shortTermOrderTxBytes,
+        offchainUpdates,
+        true,  // postOnlyFilter = true
+    )
+    // ↑ 重新执行本地验证器在上一块放置的操作
+
+    // ═══════════════════════════════════════════════════
+    // 阶段8: 清算和去杠杆化
+    // ═══════════════════════════════════════════════════
+    liquidatableSubaccountIds := k.GetSubaccountLiquidationInfo(ctx)
+    subaccountsToDeleverage, err := k.LiquidateSubaccountsAgainstOrderbook(
+        ctx,
+        liquidatableSubaccountIds,
+    )
+    if err := k.DeleverageSubaccounts(ctx, subaccountsToDeleverage); err != nil {
+        panic(err)
+    }
+
+    // ═══════════════════════════════════════════════════
+    // 阶段9: 重新加载所有订单（完整通过）
+    // ═══════════════════════════════════════════════════
+    offchainUpdates = k.PlaceStatefulOrdersFromLastBlock(
+        ctx,
+        longTermOrderIds,
+        offchainUpdates,
+        false,  // postOnlyFilter = false
+    )
+    // ↑ 允许立即成交
+
+    offchainUpdates = k.PlaceConditionalOrdersTriggeredInLastBlock(
+        ctx,
+        conditionalOrderIds,
+        offchainUpdates,
+        false,  // postOnlyFilter = false
+    )
+
+    // ═══════════════════════════════════════════════════
+    // 阶段10: 重放本地操作（完整通过）
+    // ═══════════════════════════════════════════════════
+    replayUpdates = k.MemClob.ReplayOperations(
+        ctx,
+        localValidatorOperationsQueue,
+        shortTermOrderTxBytes,
+        offchainUpdates,
+        false,  // postOnlyFilter = false
+    )
+
+    // ═══════════════════════════════════════════════════
+    // 阶段11: 初始化新流
+    // ═══════════════════════════════════════════════════
+    k.MemClob.InitializeNewStreams(ctx)
+
+    ctx.Logger().Info("CLOB PrepareCheckState Complete")
+}
+```
+
+**两轮放置的原因**：
+
+1. **Post-Only通过**（第一轮）：
+   - 仅放置不会立即成交的订单
+   - 避免自成交
+   - 建立订单簿流动性
+
+2. **完整通过**（第二轮）：
+   - 允许订单与现有订单交叉成交
+   - 生成撮合操作
+   - 完整重建MemClob状态
+
+#### D.2.5 状态一致性保证
+
+**关键机制**：
+
+```
+区块N结束:
+├─ EndBlocker更新ProcessProposerMatchesEvents
+├─ 记录所有已填充、过期、取消的订单ID
+└─ 持久化到MemStore
+
+PrepareCheckState:
+├─ 读取ProcessProposerMatchesEvents
+├─ 清除MemClob中的这些订单
+├─ 从KVStore重新加载长期订单
+├─ 重放本地操作
+└─ MemClob状态 = DeliverState + 本地未确认操作
+
+CheckTx (区块N+1):
+├─ 基于同步后的MemClob
+├─ 新订单可以正确验证
+└─ 不会与已完成的订单冲突
+
+区块N+1被提议:
+├─ PrepareProposal使用当前MemClob
+├─ 生成新的MsgProposedOperations
+└─ 包含区块N+1的所有操作
+
+DeliverTx (区块N+1):
+├─ 持久化新的成交结果
+├─ 不修改MemClob
+└─ 准备下一轮同步
+```
+
+#### D.2.6 修改总结表
+
+| 阶段 | MemClob订单簿 | MemClob操作队列 | KVStore | MemStore | TransientStore |
+|------|-------------|---------------|---------|----------|---------------|
+| **CheckTx** | ✅ 添加订单 | ✅ 记录操作 | ❌ | ❌ | ✅ 未提交订单 |
+| **DeliverTx** | ❌ 不修改 | ❌ 不修改 | ✅ 持久化填充量 | ✅ 记录已交付 | ❌ |
+| **PrepareCheckState** | ✅ 清除+重建 | ✅ 清空+重放 | 🔍 读取 | 🔍 读取 | ❌ |
+| **EndBlocker** | ❌ | ❌ | ✅ 删除过期 | ✅ 更新事件 | ❌ |
+
+**图示说明**：
+- ✅：写入/修改
+- ❌：不操作
+- 🔍：只读
+
+#### D.2.7 常见误解澄清
+
+**误解1**："DeliverTx也修改MemClob"
+- ❌ **错误**：DeliverTx不调用`MemClob.PlaceOrder()`
+- ✅ **正确**：DeliverTx只更新KVStore中的持久化状态
+- 📍 **证据**：[msg_server_proposed_operations.go](protocol/x/clob/keeper/msg_server_proposed_operations.go) 中只有`PersistMatchToState()`
+
+**误解2**："CheckTx的MemClob修改会影响共识"
+- ❌ **错误**：CheckTx修改的是CheckState，是临时的
+- ✅ **正确**：只有DeliverState的持久化状态参与共识
+- 📍 **机制**：PrepareCheckState每个区块都重新同步
+
+**误解3**："MemClob在所有节点上都相同"
+- ❌ **错误**：不同节点的MemClob可能不同
+- ✅ **正确**：
+  - DeliverState中的KVStore是一致的（共识保证）
+  - CheckState中的MemClob可能包含本地未确认订单
+  - PrepareCheckState同步核心状态，但保留本地操作
+
+**误解4**："短期订单不持久化"
+- ⚠️ **部分正确**：订单本身不持久化
+- ✅ **更准确**：订单的**填充量**会持久化到KVStore
+- 📍 **位置**：`OrderAmountFilledKeyPrefix = "Fill:"`
+
+#### D.2.8 实际代码验证
+
+让我们看一些关键代码片段来验证上述分析：
+
+**CheckTx确实修改MemClob**：
+```go
+// protocol/x/clob/memclob/memclob.go:PlaceOrder()
+func (m *MemClobPriceTimePriority) PlaceOrder(...) {
+    // ...验证...
+
+    // 添加到订单簿 - 这是对MemClob的修改！
+    m.mustAddOrderToOrderbook(ctx, order, isPostOnlyOrder)
+
+    // 添加到操作队列 - 这也是对MemClob的修改！
+    m.operationsToPropose.MustAddShortTermOrderPlacementToOperationsQueue(...)
+}
+```
+
+**DeliverTx不修改MemClob**：
+```go
+// protocol/x/clob/keeper/msg_server_proposed_operations.go
+func (k msgServer) ProposedOperations(...) {
+    lib.AssertDeliverTxMode(ctx)  // 确保在DeliverTx
+
+    // 处理操作
+    for _, operation := range operations {
+        k.PersistMatchToState(ctx, match)  // 写KVStore
+        k.AddDeliveredLongTermOrderId(ctx, orderId)  // 写MemStore
+        // 注意：没有调用MemClob.PlaceOrder()！
+    }
+}
+```
+
+**PrepareCheckState同步状态**：
+```go
+// protocol/x/clob/abci.go
+func (k Keeper) PrepareCheckState(ctx sdk.Context) {
+    // 1. 清除MemClob
+    k.MemClob.RemoveAndClearOperationsQueue(ctx, operations)
+
+    // 2. 清除无效状态
+    k.MemClob.PurgeInvalidMemclobState(ctx, filledOrders, ...)
+
+    // 3. 从KVStore重新加载
+    k.PlaceStatefulOrdersFromLastBlock(ctx, orderIds, ...)
+    // ↑ 内部调用 MemClob.PlaceOrder()
+
+    // 4. 重放本地操作
+    k.MemClob.ReplayOperations(ctx, operations, ...)
+    // ↑ 也调用 MemClob.PlaceOrder()
+}
+```
+
+#### D.2.9 结论
+
+**问题1答案**：**是的，CheckTx阶段会修改MemClob状态**
+- 添加订单到订单簿
+- 记录操作到操作队列
+- 这些修改在CheckState中，不影响DeliverState
+
+**问题2答案**：**不，DeliverTx（共识后执行）不修改MemClob**
+- 仅更新KVStore中的持久化状态
+- 记录已交付订单到MemStore
+- MemClob在PrepareCheckState时同步
+
+**关键洞察**：
+- **CheckState的MemClob**：可变的、本地的、临时的
+- **DeliverState的KVStore**：不可变的、全局的、持久化的
+- **PrepareCheckState**：桥接两者，确保一致性
+
+这种设计允许：
+1. 快速的CheckTx验证（使用MemClob）
+2. 确定性的共识（基于KVStore）
+3. 本地优化（保留未确认操作）
+4. 最终一致性（通过PrepareCheckState同步）
